@@ -1,6 +1,6 @@
-target/
-target/*
-.idea/*
+target
+
+.idea
 host/*
 
 
