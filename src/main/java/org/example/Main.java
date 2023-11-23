@@ -9,8 +9,9 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.HttpClientCodec;
-import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
@@ -19,14 +20,19 @@ import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import javax.net.ssl.SSLException;
 import java.io.File;
 import java.security.cert.CertificateException;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Main {
 
-    public static final Set<Object> set = new HashSet<>();
+    public static final Map<Channel, List<Object>> messagesMap = new ConcurrentHashMap<>();
+
 
     public static void main(String[] args) {
+
 
 
         EventLoopGroup bossGroup = new NioEventLoopGroup(1);
@@ -93,9 +99,70 @@ public class Main {
 
 
             if (header.isHttps()) {
+                clientChannel.config().setAutoRead(false);
+                Bootstrap b = new Bootstrap();
+                NioEventLoopGroup group = new NioEventLoopGroup();
+                b.group(clientChannel.eventLoop()) // use the same EventLoop
+                        .channel(clientChannel.getClass())
+                        .handler(new ChannelInitializer() {
+
+                            @Override
+                            protected void initChannel(Channel channel) throws Exception {
+                                SslContext build = SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+                                SslHandler sslHandler = new SslHandler(build.newEngine(channel.alloc()));
+                                sslHandler.setHandshakeTimeoutMillis(100000);
+                                channel.pipeline()
+                                        .addLast(new  LoggingHandler(LogLevel.INFO))
+                                        .addLast(sslHandler)
+                                        .addLast(new HttpClientCodec())
+                                        .addLast(new ChannelInboundHandlerAdapter() {
+                                            @Override
+                                            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+//
+                                             clientChannel.writeAndFlush(msg);
+
+                                            }
+
+                                            @Override
+                                            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                                                remoteChannel.close();
+                                                flushAndClose(clientChannel);
+                                            }
+
+                                            @Override
+                                            public void channelActive(ChannelHandlerContext ctx) throws Exception {
+                                                clientChannel.config().setAutoRead(true);
+
+                                                List<Object> messages = messagesMap.getOrDefault(remoteChannel, Collections.emptyList());
+                                                for (Object message : messages) {
+                                                    remoteChannel.writeAndFlush(message);
+                                                }
+
+                                                header.remoteReady = true;
+
+
+                                            }
+
+                                            @Override
+                                            public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                                                remoteChannel.close();
+                                                flushAndClose(clientChannel);
+
+                                            }
+
+                                        }).addLast();
+                            }
+                        });
+                ChannelFuture f = b.connect(header.getHost(), header.getPort());
+
+
+                Channel channel = f.channel();
+
+                channel.closeFuture().addListener((ChannelFutureListener) channelFuture -> group.shutdownGracefully());
+                remoteChannel = channel;
+
                 CertificateUtil.createHostCertificate(header.getHost(), "root.crt", "root.key");
                 ByteBuf o = Unpooled.wrappedBuffer("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes());
-
                 clientChannel.writeAndFlush(o).sync();
                 SslContext build = SslContextBuilder
                         .forServer(new File(CertificateUtil.genCrtFileName(header.getHost())), new File(CertificateUtil.genKeyFileName(header.getHost())))
@@ -106,7 +173,6 @@ public class Main {
                 clientChannel.pipeline().remove("proxy");
 
                 clientChannel.pipeline().addLast(new HttpServerCodec());
-                clientChannel.pipeline().addLast(new HttpObjectAggregator(1024 * 1000 * 1000));
                 clientChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                     @Override
                     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
@@ -115,7 +181,22 @@ public class Main {
 
                     @Override
                     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                        remoteChannel.writeAndFlush(msg);
+
+                        if(header.remoteReady){
+                            remoteChannel.writeAndFlush(msg);
+                        }else {
+                            List<Object> messages = messagesMap.get(remoteChannel);
+                            if(messages != null){
+                                messages.add(msg);
+                            }else {
+                                ArrayList<Object> value = new ArrayList<>();
+                                value.add(msg);
+                                messagesMap.put(remoteChannel, value);
+                            }
+                            
+                        }
+
+                        System.out.println("remote write");
                     }
 
                     @Override
@@ -128,62 +209,7 @@ public class Main {
             } else {
                 //todo
             }
-            /**
-             *
-             * 下面为真实客户端第一次来到的时候，代理客户端向目标客户端发起连接
-             */
-            Bootstrap b = new Bootstrap();
-            NioEventLoopGroup group = new NioEventLoopGroup();
-            b.group(group) // use the same EventLoop
-                    .channel(clientChannel.getClass())
-                    .handler(new ChannelInitializer() {
 
-                        @Override
-                        protected void initChannel(Channel channel) throws Exception {
-                            SslContext build = SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build();
-                            SslHandler sslHandler = new SslHandler(build.newEngine(channel.alloc()));
-                            sslHandler.setHandshakeTimeoutMillis(100000);
-                            channel.pipeline()
-                                    .addLast(sslHandler)
-                                    .addLast(new HttpClientCodec())
-                                    .addLast(new HttpObjectAggregator(1024 * 1000 * 1000)).addLast(new ChannelInboundHandlerAdapter() {
-                                        @Override
-                                        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-//
-                                            ChannelFuture channelFuture = clientChannel.writeAndFlush(msg);
-                                            channelFuture.addListener((ChannelFutureListener) channelFuture1 -> {
-                                                clientChannel.close();
-                                                remoteChannel.close();
-                                            });
-
-                                        }
-
-                                        @Override
-                                        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-                                            remoteChannel.close();
-                                            flushAndClose(clientChannel);
-                                        }
-
-
-                                        @Override
-                                        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-                                            remoteChannel.close();
-                                            flushAndClose(clientChannel);
-
-                                        }
-
-                                    }).addLast();
-                        }
-                    });
-            ChannelFuture f = b.connect(header.getHost(), header.getPort()).sync();
-
-
-            Channel channel = f.channel();
-
-             channel.closeFuture().addListener((ChannelFutureListener) channelFuture -> {
-                group.shutdownGracefully();
-            });
-            remoteChannel = channel;
 
 
         }
@@ -212,6 +238,7 @@ public class Main {
      * 真实主机的请求头信息
      */
     private static class HttpProxyClientHeader {
+        public boolean remoteReady;
         private String method;//请求类型
         private String host;//目标主机
         private int port;//目标主机端口
